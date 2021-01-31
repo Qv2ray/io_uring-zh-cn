@@ -138,7 +138,29 @@ cqe 包含一个 `user_data` 字段。该字段是从请求提交开始就携带
 
 目前想到的长这样：
 
-![image](https://i.loli.net/2021/01/31/5XS7sDQhY2jZCVf.png)
+```c
+struct io_uring_sqe {
+   __u8 opcode;
+   __u8 flags;
+   __u16 ioprio;
+   __s32 fd;
+   __u64 off;
+   __u64 addr;
+   __u32 len;
+   union {
+       __kernel_rwf_t rw_flags;
+       __u32 fsync_flags;
+       __u16 poll_events;
+       __u32 sync_range_flags;
+       __u32 msg_flags;   
+   };
+   __u64 user_data;
+   union {
+       __u16 buf_index;
+       __u64 __pad2[3];
+   };
+};
+```
 
 和完成事件类似，提交端的数据结构叫做提交队列项（Submission Queue Entry），或者简称 sqe。
 
@@ -178,6 +200,76 @@ cqe 包含一个 `user_data` 字段。该字段是从请求提交开始就携带
 
 通讯是通过一个环缓冲区管理的。当一个新事件被内核提交到完成请求环（CQ 环）中时，它会更新与其相连的尾节点。当程序从中消耗一项时，它会更新头节点。因此，只要头尾节点不同，应用就知道还有一个或更多事件可以用来消耗。
 
-环计数器（ring counter）本身是自由流动的 32 位整数，当环中事件的数目超过环的容量时，依靠自然进位处理。（译者：？？？？？）
+环计数器（ring counter）本身是自由流动的 32 位整数，当环中事件的数目超过环的容量时，依靠自然进位处理。这种方法的一个优点是，我们可以利用整个环的大小，而不必在一旁管理一个“环满了”的 flag（这将让环的管理变得复杂）。因此，环的尺寸必须是 2 的整数次方。
 
-> WIP...
+要查找事件的索引，应用程序必须用环的大小掩码（size mark）对当前尾索引（current tail index）进行掩码（masking）操作。大概看起来像是这样：
+
+```c
+unsigned head;
+
+head = cqring->head;
+read_barrier();
+if (head != cqring->tail) {
+    struct io_uring_cqe *cqe;
+    unsigned index;
+    
+    index = head & * (cqring->mask);
+    cqe = &cqring->cqes[index];
+    /* process completed cqe here */
+    ...
+    /* we've now consumed this entry */
+    head++;
+}
+
+cqring->head = head;
+write_barrier();
+```
+
+`ring->cqes[]` 是 `io_uring_cqe` 结构的共用数组。下一小节中我们将深入讨论这个共享内存（以及 `io_uring` 实例本身）如何设置和管理，以及神奇的读写屏障操作究竟有什么用。
+
+对提交方来说，角色是正好相反的。应用程序是更新尾部的那一个，而内核负责消耗项目（并更新头部）。一个很重要的区别是，尽管完成队列环（CQ ring）直接索引 cqe 的共享数组，提交方与这些元素之间还有一个中间数组（indirection array）。因此，提交端的环形缓冲区是这个数组的索引，而数组又包含到 sqes 中的索引。
+
+这在一开始可能看起来很奇怪和令人困惑，但这是有原因的。有些应用程序可能会在内部数据结构中嵌入请求单元，这允许它们灵活地这样做，同时保留在一个操作中提交多个 sqe 的能力。这反过来使得上述应用程序更容易迁移到 `io_uring` 的接口。
+
+添加一个 sqe 供内核使用基本上是从内核获取 cqe 的相反操作。一个典型的例子是这样的:
+
+```c
+struct io_uring_sqe *sqe;
+unsigned tail, index;
+
+tail = sqring->tail;
+index = tail & (*sqring->ring_mask);
+sqe = &sqring->sqes[index];
+
+/* this call fills in the sqe entries for this IO */
+init_io(sqe);
+
+/* fill the sqe index into the SQ ring array */
+sqring->array[index] = index;
+tail++;
+
+write_barrier();
+sqring->tail = tail;
+write_barrier();
+```
+
+和 CQ 环一样，读写屏障将在后面解释。上面是一个简化的例子，它假设 SQ 环当前是空的，或者至少它还有多个项目的空间。
+
+一旦内核使用了 sqe，应用程序就可以自由地重用这个 sqe 条目。即使在内核还没有完全使用给定的 sqe 的情况下也是如此。如果内核在条目被使用之后确实需要访问它，那么它将获得一个稳定的副本。为什么会发生这种情况并不一定重要，但是它对应用程序有一个重要的副作用。
+
+通常情况下，应用程序会请求一个给定大小的环，并且假设这个大小可能直接对应于应用程序在内核中可以有多少个挂起的请求。但是，由于 sqe 生存期（lifetime）仅仅是实际提交的 sqe 生存期，因此应用程序可能会开出比 SQ 环大小指示的更高的挂起请求计数。应用程序必须注意不要这样做，否则可能会有 CQ 环溢出的风险。
+
+默认情况下，CQ 环的大小是 SQ 环的两倍。这使得应用程序在管理这方面具有一定的灵活性，但并不能完全消除这样做的必要性。如果应用程序确实违反了这个限制，它将被追踪为 CQ 环中的一个溢出条件。稍后会有更多细节。
+
+完成事件可以以任何顺序到达，请求提交和关联完成之间没有顺序。SQ 环和 CQ 环相互独立运行。然而，完成事件将始终对应于给定的提交请求。因此，完成事件总是与特定的提交请求相关联。
+
+### 5.0 `io_uring` 接口
+
+就像 aio 一样，`io_uring` 也有许多与之相关的系统调用来定义它的操作。第一个是一个系统调用，用来设置一个 `io_uring` 实例:
+
+```c
+int io_uring_setup(unsigned entries, struct io_uring_params *params);
+```
+
+> TO BE CONTINUED.
+
